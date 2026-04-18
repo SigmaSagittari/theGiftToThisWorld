@@ -14,6 +14,8 @@
 #include <limits>
 #include <functional>
 #include <bit>
+#include <windows.h>
+#include <fstream>
 using namespace std;
 
 inline unsigned long long splitmix64(unsigned long long x) {
@@ -22,6 +24,11 @@ inline unsigned long long splitmix64(unsigned long long x) {
    x = (x ^ (x >> 27)) * 0x94d049bb133111eb;
    return x ^ (x >> 31);
 }
+
+// Global trace for game-specific debugging
+inline std::ofstream g_trace_file;
+inline bool g_trace_enabled = false;
+
 
 // ==================== 数据 ====================
 struct GameState {
@@ -610,7 +617,7 @@ class 概率分析 {
       vector<随机生成结果::连通块结果> current_counts;
       current_counts.reserve(connect_distributions.size());
       auto dfs = [&](int block_index, int remaining_mines, auto&& dfs_ref) -> void {
-         if (block_index == connect_distributions.size()) {
+         if (block_index == (int)connect_distributions.size()) {
             if (remaining_mines >= 0 && remaining_mines <= Tsum) {
                随机生成结果 result;
                result.full_result = current_counts;
@@ -671,6 +678,7 @@ class 概率分析 {
    }
    地雷概率 gen_random(const GameState& state, const 基础逻辑结果& basic, const 棋盘结构& structure, const vector<连通块地雷分布>& mine_distrube, unsigned long long& seed) {
       // 均匀随机生成一个符合当前棋盘状态的雷分布，并返回每个格子是雷的概率（0或1）。
+      unsigned long long local_seed = seed;
       地雷概率 result;
       result.probability = vector<vector<long double>>(state.rows + 1, vector<long double>(state.cols + 1, 0.0));
       for (int i = 1; i <= state.rows; ++i)
@@ -689,13 +697,27 @@ class 概率分析 {
       随机生成结果 res = randomAnalysis(mine_distrube, mines, Tsum, seed);
       for (int i = 0; i < (int)structure.board_struct.size(); ++i) {
          int choosed_idx = -1;
-         for (int idx = 0; idx < (int)res.full_result.size(); ++idx)
+         for (int idx = 0; idx < (int)(mine_distrube[i].分布们.size()); ++idx)
             if (mine_distrube[i].分布们[idx].mine_count == res.full_result[i].mine_count) {
                choosed_idx = idx;
                break;
             }
          if (choosed_idx == -1) {
             cerr << "发生未知错误，程序终止。" << endl;
+            cerr << "[LOG] " << endl;
+            cerr << "SEED : " << local_seed << endl;
+            cerr << "局面:" << endl;
+            for (int x = 1; x <= state.rows; ++x) {
+               for (int y = 1; y <= state.cols; ++y) {
+                  if (state.flags[x][y]) cerr << 'F';
+                  else if (state.board[x][y] == GameState::Cell::H) cerr << 'H';
+                  else cerr << static_cast<int> (state.board[x][y]);
+
+               }
+               cerr << endl;
+            }
+            cerr << "分布：" << i << endl;
+            cerr << "期望地雷数: " << res.full_result[i].mine_count << "但是没有找到" << endl;
             assert(false);
          }
          const 连通块地雷分布::分布& chosen = mine_distrube[i].分布们[choosed_idx];
@@ -860,15 +882,15 @@ class 概率分析 {
    }
 };
 class ZiniAlgo {
-   public:
+   private:
    vector<vector<bool>> need_open, bbv, Fl;
    vector<vector<int>> opening_id, hide_val, priority;
 
    public:
 
-   template<bool randomize>
-   pair<int, int> Gzini(const GameState& state, const 地雷概率& prob, unsigned long long* seed = nullptr) {
-      // 如果开启随机化的话，默认你要进行大量的计算了，所以此时会关闭 3Bv 计算，直接返回 0，避免不必要的性能损失。
+   template<bool randomize, bool fixed>
+   pair<int, int> Gzini(const GameState& state, const 地雷概率& prob, int x = 0, int y = 0, unsigned long long* seed = nullptr) {
+      int cls = 0;
       if constexpr (randomize) {
          if (seed == nullptr) {
             cerr << "oh wow，你是人啊？" << endl;
@@ -898,12 +920,11 @@ class ZiniAlgo {
                bbv[i][j] = false;
                need_open[i][j] = false;
             }
-            if (state.board[i][j] != GameState::Cell::H) {
-               bbv[i][j] = false;
+            if (state.board[i][j] != GameState::Cell::H)
                need_open[i][j] = false;
-            }
          }
       }
+
       int ops = 0;
       // reuse a single flood buffer to avoid repeated allocations
       vector<pair<int, int>> flood;
@@ -951,18 +972,28 @@ class ZiniAlgo {
 
       // 3.5) 计算 bv，拿来做返回值用！
       int bv = 0;
-      if constexpr (!randomize) {
-         // 随机化就关掉它！！
+      if constexpr (randomize == false && fixed == false) {
+         // 如果开启随机化 / 固定首步采样的话，默认你要进行大量的计算了，所以此时会关闭 3Bv 计算，直接返回 0，避免不必要的性能损失。
          for (int i = 1; i <= R; ++i)
             for (int j = 1; j <= C; ++j)
-               if (hide_val[i][j] != 0 && bbv[i][j] && need_open[i][j]) bv++;
+               if (hide_val[i][j] != 0 && bbv[i][j]) bv++;
 
       }
 
+      for (int i = 1; i <= R; ++i)
+         for (int j = 1; j <= C; ++j)
+            if (state.board[i][j] != GameState::Cell::H)
+               bbv[i][j] = false;
 
       // 4) priority 计算
       for (int i = 1; i <= R; ++i) {
          for (int j = 1; j <= C; ++j) {
+            if constexpr (fixed) {
+               if (i == x && j == y) {
+                  priority[i][j] = 10000; // 固定返回这个格子
+                  continue;
+               }
+            }
             if (hide_val[i][j] == 0) {
                priority[i][j] = 0;
                continue;
@@ -986,7 +1017,6 @@ class ZiniAlgo {
       }
 
       vector<pair<int, int>> check[8]; // check[i] 储存优先级为 i 的格子。
-      int cls = 0;
       for (int i = 1; i <= R; ++i) {
          for (int j = 1; j <= C; ++j) {
             if (priority[i][j] >= 0) {
@@ -1065,7 +1095,7 @@ class ZiniAlgo {
                   if (!need_open[nx][ny]) continue;
                   need_open[nx][ny] = false;
 
-				  priority[nx][ny]++; 
+                  priority[nx][ny]++; // 削弱没了。
                   maximum = max(maximum, priority[nx][ny]);
                   if (priority[nx][ny] >= 0) check[priority[nx][ny]].push_back({ nx,ny });
 
@@ -1096,7 +1126,7 @@ class ZiniAlgo {
                            auto cur2 = flood.back(); flood.pop_back();
                            int fx = cur2.first, fy = cur2.second;
                            if (need_open[fx][fy]) {
-                              priority[fx][fy]++; 
+                              priority[fx][fy]++; // 削弱没了。
                               maximum = max(maximum, priority[fx][fy]);
                               if (priority[fx][fy] >= 0) check[priority[fx][fy]].push_back({ fx,fy });
                               need_open[fx][fy] = false;
@@ -1108,7 +1138,7 @@ class ZiniAlgo {
                               if (hide_val[nnx][nny] == 0 && need_open[nnx][nny]) {
                                  // mark and push
                                  need_open[nnx][nny] = false; // mark as processed to avoid duplicates
-                                 priority[nnx][nny]++; 
+                                 priority[nnx][nny]++; // 削弱没了。
                                  maximum = max(maximum, priority[nnx][nny]);
                                  if (priority[nnx][nny] >= 0) check[priority[nnx][nny]].push_back({ nnx,nny });
                                  flood.push_back({ nnx, nny });
@@ -1117,7 +1147,7 @@ class ZiniAlgo {
                                  if (hide_val[nnx][nny] != 0) {
                                     if (need_open[nnx][nny]) {
                                        need_open[nnx][nny] = false;
-                                       priority[nnx][nny]++; 
+                                       priority[nnx][nny]++; // 削弱没了。
                                        maximum = max(maximum, priority[nnx][nny]);
                                        if (priority[nnx][nny] >= 0) check[priority[nnx][nny]].push_back({ nnx,nny });
                                        vis[nnx][nny] = true;
@@ -1163,7 +1193,7 @@ class ZiniAlgo {
                   auto cur2 = flood.back(); flood.pop_back();
                   int fx = cur2.first, fy = cur2.second;
                   need_open[fx][fy] = false;
-                  priority[fx][fy]++; 
+                  priority[fx][fy]++; // 削弱没了。
                   maximum = max(maximum, priority[fx][fy]);
                   if (priority[fx][fy] >= 0) check[priority[fx][fy]].push_back({ fx,fy });
                   bbv[fx][fy] = false;
@@ -1172,7 +1202,7 @@ class ZiniAlgo {
                      if (nnx < 1 || nnx > R || nny < 1 || nny > C) continue;
                      if (hide_val[nnx][nny] == 0 && need_open[nnx][nny]) {
                         need_open[nnx][nny] = false;
-                        priority[nnx][nny]++; 
+                        priority[nnx][nny]++; // 削弱没了。
                         maximum = max(maximum, priority[nnx][nny]);
                         if (priority[nnx][nny] >= 0) check[priority[nnx][nny]].push_back({ nnx,nny });
                         flood.push_back({ nnx, nny });
@@ -1181,7 +1211,7 @@ class ZiniAlgo {
                         if (hide_val[nnx][nny] != 0) {
                            if (need_open[nnx][nny]) {
                               need_open[nnx][nny] = false;
-                              priority[nnx][nny]++; 
+                              priority[nnx][nny]++; // 削弱没了。
                               maximum = max(maximum, priority[nnx][nny]);
                               if (priority[nnx][nny] >= 0) check[priority[nnx][nny]].push_back({ nnx,nny });
                               vis[nnx][nny] = true;
@@ -1218,16 +1248,16 @@ class ZiniAlgo {
 
    int Rzini(const GameState& state, const 地雷概率& prob, unsigned long long& seed, int iter) {
       // RandomZini，专治各种疑难杂症局面。
-      int best = numeric_limits<int>::max();
+      int best = 2147483647;
       for (int it = 0; it < iter; ++it) {
-         auto pr = Gzini<true>(state, prob, &seed);
+         auto pr = Gzini<true, false>(state, prob, 0, 0, &seed);
          if (pr.first < best) best = pr.first;
       }
-      return best == numeric_limits<int>::max() ? -1 : best;
+      return best == 2147483647 ? -1 : best;
    }
    int Zini_8way(const GameState& state, const 地雷概率& prob) {
       // 对 8 个对称变换（D4）进行计算，取最小值
-      int best = numeric_limits<int>::max();
+      int best = 2147483647;
       int R = state.rows, C = state.cols;
       for (int t = 0; t < 8; ++t) {
          int Rt = (t % 2 == 1 || t == 6 || t == 7) ? C : R; // for rot90/rot270/diag swap dims
@@ -1288,93 +1318,121 @@ class ZiniAlgo {
             }
          }
 
-         int val = Gzini<false>(ts, tprob).first;
+         int val = Gzini<false, false>(ts, tprob).first;
          if (val < best) best = val;
       }
       return best == INT_MAX ? 0 : best;
    }
 
+   int ZiNiDelta(const GameState& state, const 地雷概率& prob, int x, int y) {
+      if (prob.probability[x][y] == 1.0L) return -100; // 已经是 1 的格子，点了就死了
+      int zini_cur = Gzini<false, true>(state, prob).first;
+      int zini_after = 0;
+ // 没写完
+      if (state.board[x][y] == GameState::Cell::H) { // 单击
+         int hide_val = 0;
+         for_each_adjacent(x, y, state.rows, state.cols, [&](int nx, int ny) {
+            if (prob.probability[nx][ny] == 1.0L) hide_val++;
+         });
+         if (hide_val != 0) { // 不是 0 的话直接点开就好。
+            GameState copyState = state;
+            copyState.board[x][y] = static_cast<GameState::Cell>(hide_val);
+            zini_after = Gzini<false, true>(copyState, prob).first + 1;
+         }
+         else zini_after = Gzini<false, true>(state, prob, x, y).first + 1; // 是 0 的话懒得处理了，直接传进去改一下优先级就能自己处理了。
+      }
+      else { // chord
+         zini_after = Gzini<false, true>(state, prob, x, y).first;
+      }
+      return zini_cur - zini_after;
+   }
+};
+class EffAlgo {
+   public:
+   struct 高ZNE下地雷分布 {
+      int result_count;
+      地雷概率 prob;
+   };
+   private:
+   ZiniAlgo algo;
+   template<typename Callback, bool shouldCallBack>
+   高ZNE下地雷分布 地雷分布_inside(const GameState& state, const 基础逻辑结果& basic, const 棋盘结构& structure, const vector<连通块地雷分布>& mine_distrube
+                  , unsigned long long& seed, int iter, long double Gzinilim, long double G10Zinilim, int clsDone, Callback callback=[]{}) {
+      地雷概率 res_prob = { vector<vector<long double>>(state.rows + 1, vector<long double>(state.cols + 1, 0.0L)) };
+      int result_cnt = 0;
+      for (int i = 1; i <= iter; ++i) {
+         地雷概率 random_result = 概率分析().gen_random(state, basic, structure, mine_distrube, seed);
+         pair<int, int> zini_res = algo.Gzini<false, false>(state, random_result);
+         if (zini_res.second * 1.0 / (zini_res.first + clsDone) < 1) {
+            cerr << "该调 bug 了！" << endl;
+            for (int i = 1; i <= state.rows; ++i) {
+               for (int j = 1; j <= state.cols; ++j) {
+                  cerr << (int)random_result.probability[i][j];
+               }
+               cerr << endl;
+            }
+            cerr << "bv = " << zini_res.second << ',' << "cls = " << zini_res.first + clsDone << endl;
+            assert(false);
+         }
+         if (zini_res.second * 1.0 / (zini_res.first + clsDone) < Gzinilim) continue;
+         int zini_10res = algo.Rzini(state, random_result, seed, 10);
+         if (zini_res.second * 1.0 / (zini_10res + clsDone) < G10Zinilim) continue;
+         // 找到一个高 ZNE 的结果了！把它加入统计
+         result_cnt++;
+         for (int x = 1; x <= state.rows; ++x)
+            for (int y = 1; y <= state.cols; ++y)
+               res_prob.probability[x][y] += random_result.probability[x][y];
+         if constexpr (shouldCallBack)
+            callback(random_result);
+      }
+      // 归一化（如果没有找到任何结果，则保持为 0）
+      if (result_cnt > 0) {
+         for (int x = 1; x <= state.rows; ++x)
+            for (int y = 1; y <= state.cols; ++y)
+               res_prob.probability[x][y] /= result_cnt;
+      }
+      return { result_cnt, res_prob };
+   }
+   地雷概率 ZNR表_inside(const GameState& state, const 基础逻辑结果& basic, const 棋盘结构& structure, const vector<连通块地雷分布>& mine_distrube
+					, unsigned long long& seed, int iter, long double Effreq, int clsDone) {
+      int cnt = 0; 
+      auto callBack = [&](const 地雷概率& prob) { // 这里的 prob 是高 ZNE 排布
+         cnt++;
+         /*
+         if (cnt < 20) {
+            for(int i=1;i<=state.rows;++i)
+               for (int j = 1; j <= state.cols; ++j) {
+                  res.probability[i][j] += algo.ZiNiDelta(state, prob, i, j);
+               }
+              
+         }*/
+      }; 
+      地雷分布_inside<decltype(callBack), true>(state, basic, structure, mine_distrube, seed, iter, Effreq * 0.8L, Effreq, clsDone, callBack);
+   }
+   public:
+   高ZNE下地雷分布 地雷分布(const GameState& state, unsigned long long& seed, int iter, long double Gzinilim, long double G10Zinilim, int clsDone) {
+      基础逻辑结果 basic = 基础逻辑分析().analyze(state);
+      棋盘结构 棋盘结构_ = 连通块构造().brute_build_struct(state, basic);
+      vector<连通块地雷分布> dists = 连通块地雷分布计算().analysis(棋盘结构_, true);
+      return 地雷分布_inside<function<void()>,false>(state, basic, 棋盘结构_, dists, seed, iter, Gzinilim, G10Zinilim, clsDone);
+   }
+   地雷概率 ZNR表(const GameState& state,int iter, unsigned long long& seed, long double Effreq, int clsDone) {
+      基础逻辑结果 basic = 基础逻辑分析().analyze(state);
+      棋盘结构 棋盘结构_ = 连通块构造().brute_build_struct(state, basic);
+      vector<连通块地雷分布> dists = 连通块地雷分布计算().analysis(棋盘结构_, true);
+      return ZNR表_inside(state, basic, 棋盘结构_, dists, seed, iter, Effreq, clsDone);
+   }
 };
 // ==================== 主求解器 ====================
-class Solver {
-   public:
-   GameState state;
-
-   Solver(int n, int m, int mines, const vector<vector<char>>& input)
-      : state(n, m, mines) {
-      // 导入棋盘
-      for (int i = 1; i <= n; ++i) {
-         for (int j = 1; j <= m; ++j) {
-            if (input[i][j] == 'F') {
-               state.board[i][j] = GameState::Cell::H;
-               state.flags[i][j] = true;
-            }
-            else if (input[i][j] == 'H') {
-               state.board[i][j] = GameState::Cell::H;
-            }
-            else {
-               state.board[i][j] = static_cast<GameState::Cell>(input[i][j] - '0');
-            }
-         }
-      }
-   }
-
-   // 基础分析
-   基础逻辑结果 analyze_basic() {
-      基础逻辑分析 analyzer;
-      return analyzer.analyze(state);
-   }
-   // 构造连通块结构（调试用）
-   棋盘结构 build_structure(const 基础逻辑结果& basic) {
-      连通块构造 builder;
-      return builder.brute_build_struct(state, basic);
-   }
-};
-
 
 // ==================== main ====================
-// simple callback printing up to a limit of generated full placements
-static int g_print_limit = 3000;
-static int g_print_count = 0;
-static int g_callback_total = 0;
-static int g_duplicate_count = 0;
-static unordered_set<string> g_unique_placements;
-static vector<string> g_all_layouts;
-void print_prob_callback(const 地雷概率& prob) {
-   // always count callbacks and check duplicates, but only print first g_print_limit
-   g_callback_total++;
-   int R = (int)prob.probability.size() - 1;
-   if (R <= 0) return;
-   int C = (int)prob.probability[1].size() - 1;
-   // build string representation
-   string s; s.reserve(R * C);
-   for (int i = 1; i <= R; ++i) {
-      for (int j = 1; j <= C; ++j) {
-         s.push_back(prob.probability[i][j] >= 0.5L ? 'M' : '.');
-      }
-   }
-   // save every callback layout (may be large; we guard enumeration by candidates threshold)
-   g_all_layouts.push_back(s);
-   auto ins = g_unique_placements.insert(s);
-   if (!ins.second) g_duplicate_count++;
-   if (g_print_count >= g_print_limit) return;
-   g_print_count++;
-   cout << "Placement #" << g_print_count << "\n";
-   for (int i = 1; i <= R; ++i) {
-      for (int j = 1; j <= C; ++j) {
-         cout << (prob.probability[i][j] >= 0.5L ? 'M' : '.');
-      }
-      cout << '\n';
-   }
-   cout << "---\n";
-   cout.flush();
-}
 
 int main() {
    ios::sync_with_stdio(false);
    cin.tie(nullptr);
+
+
    int n, m, mines; char t;
-   // input format: <cols> x <rows> x <mines>
    if (!(cin >> m >> t >> n >> t >> mines)) return 0;
 
    int R = n, C = m;
@@ -1382,107 +1440,50 @@ int main() {
    rows.reserve(R);
    for (int i = 0; i < R; ++i) {
       string s; cin >> s;
-      // if the provided line is shorter/longer, adjust as needed
       if ((int)s.size() < C) s.append(C - (int)s.size(), 'H');
       rows.push_back(s);
    }
 
    GameState gs(R, C, mines);
-   gs.flags = vector<vector<bool>>(R + 1, vector<bool>(C + 1, false));
-   for (int i = 1; i <= R; ++i) {
-      for (int j = 1; j <= C; ++j) {
-         char c = rows[i - 1][j - 1];
-         if (c == 'F') {
-            gs.board[i][j] = GameState::Cell::H;
-            gs.flags[i][j] = true;
+   for (int i = 0; i < R; ++i) {
+      for (int j = 0; j < C; ++j) {
+         char ch = rows[i][j];
+         if (ch == 'H' || ch == 'h') {
+            gs.board[i + 1][j + 1] = GameState::Cell::H;
          }
-         else if (c == 'H' || c == '.') {
-            gs.board[i][j] = GameState::Cell::H;
+         else if (ch == 'F' || ch == 'f') {
+            gs.flags[i + 1][j + 1] = true;
          }
-         else if (c >= '0' && c <= '8') {
-            gs.board[i][j] = static_cast<GameState::Cell>(c - '0');
+         else if (ch >= '0' && ch <= '8') {
+            gs.board[i + 1][j + 1] = static_cast<GameState::Cell>(ch - '0');
          }
          else {
-         // unknown char (like 'M'), treat as hidden
-            gs.board[i][j] = GameState::Cell::H;
+            gs.board[i + 1][j + 1] = GameState::Cell::H;
          }
       }
    }
 
-   基础逻辑分析 basic_an;
-   基础逻辑结果 basic = basic_an.analyze(gs);
-   连通块构造 builder;
-   棋盘结构 structure = builder.brute_build_struct(gs, basic);
-   连通块地雷分布计算 dist_calc;
-   vector<连通块地雷分布> dists = dist_calc.analysis(structure, true);
+   int clsDone = 0;
+   if (!(cin >> clsDone)) clsDone = 0;
 
-   概率分析 pa;
-   // 先计算高级分析结果以获得候选方案数（candidates），用于提前判断组合爆炸
-   高级分析结果 adv = pa.analysis(gs, basic, structure, dists);
-   // 如果候选方案数很大，则不枚举全部布局
-   if (adv.candidates >= 3000.0L) {
-      cout << "过多：候选方案数 = " << static_cast<long long>(llround(adv.candidates)) << " >= 1000，跳过枚举。\n";
-      cout << "理论候选数（candidates）=" << adv.candidates << "\n";
+   unsigned long long seed = 123456789ULL;
+   int iter = 10000;
+   long double Gzinilim = 1.500L;
+   long double G10Zinilim = 2.000L;
+
+   EffAlgo eff;
+   auto out = eff.地雷分布(gs, seed, iter, Gzinilim, G10Zinilim, clsDone);
+
+   cout << "result_count: " << out.result_count << "\n";
+   cout << fixed << setprecision(6);
+   for (int i = 1; i <= R; ++i) {
+      for (int j = 1; j <= C; ++j) {
+         cout << out.prob.probability[i][j];
+         if (j < C) cout << ' ';
+      }
+      cout << '\n';
    }
-   else {
-   // reset globals used by callback
-      g_callback_total = 0;
-      g_duplicate_count = 0;
-      g_print_count = 0;
-      g_all_layouts.clear();
-      g_unique_placements.clear();
-      // 枚举所有布局并由回调统计
-      pa.all_distrubte(gs, basic, structure, dists, print_prob_callback);
-      cout << "枚举回调总数 = " << g_callback_total << "，唯一布局数 = " << g_unique_placements.size() << "，重复回调 = " << g_duplicate_count << "\n";
-      cout << "理论候选数（candidates）=" << adv.candidates << "\n";
-      long long candidates_rounded = llround(adv.candidates);
-      if ((long long)g_unique_placements.size() != candidates_rounded) {
-         cout << "注意：枚举得到的唯一布局数=" << g_unique_placements.size() << " 与高级分析的 candidates=" << adv.candidates << " 不一致（四舍五入后=" << candidates_rounded << "）。\n";
-      }
-      else {
-         cout << "校验通过：枚举唯一布局数与 candidates 匹配（" << candidates_rounded << "）。\n";
-      }
-      cout << "Printed " << g_print_count << " placements (limit " << g_print_limit << ")\n";
 
-      // allow user to query a specific enumerated placement by index
-      if (!g_all_layouts.empty()) {
-         cout << "可用布局数: " << g_all_layouts.size() << ". 输入编号 (1~" << g_all_layouts.size() << ") 查看对应布局，输入 0 退出:\n";
-         while (true) {
-            long long q = 0;
-            if (!(cin >> q)) break;
-            if (q == 0) break;
-            if (q < 1 || q >(long long)g_all_layouts.size()) {
-               cout << "编号越界，请输入 1 到 " << g_all_layouts.size() << " 或 0 退出:\n";
-               continue;
-            }
-            const string& s = g_all_layouts[(size_t)q - 1];
-            cout << "布局 #" << q << "\n";
-            for (int i = 0; i < R; ++i) {
-               cout << s.substr(i * C, C) << '\n';
-            }
-            cout << "---\n";
-            // 构造对应的 地雷概率 prob（M -> 1.0, . -> 0.0）并调用 Rzini(iter=1000)
-            地雷概率 selprob;
-            selprob.probability = vector<vector<long double>>(R + 1, vector<long double>(C + 1, 0.0L));
-            for (int i = 0; i < R; ++i) {
-               for (int j = 0; j < C; ++j) {
-                  char ch = s[(size_t)i * C + j];
-                  selprob.probability[i + 1][j + 1] = (ch == 'M') ? 1.0L : 0.0L;
-               }
-            }
-            ZiniAlgo zini;
-
-            unsigned long long seed = (unsigned long long)chrono::high_resolution_clock::now().time_since_epoch().count();
-
-            for (int i = 1; i <= m; ++i)
-               for (int j = 1; j <= n; ++j)
-                  gs.board[i][j] = GameState::Cell::H;
-
-            int rz = zini.Rzini(gs, selprob, seed, 1000);
-            cout << "Rzini(1000) 结果: " << rz << "\n";
-            cout << "继续输入编号查看，或 0 退出:\n";
-         }
-      }
-   }
    return 0;
 }
+
